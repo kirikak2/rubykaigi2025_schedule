@@ -7,12 +7,23 @@ require 'open-uri'
 require 'date'
 require 'json'
 require 'optparse'
+require 'uri'
 
 class RubyKaigiScheduleParser
   SCHEDULE_URL = 'https://rubykaigi.org/2025/schedule/'
+  BASE_URL = 'https://rubykaigi.org'
   
-  def initialize(url = nil)
+  attr_reader :schedule
+  
+  def initialize(url = nil, fetch_details = false)
     @url = url || SCHEDULE_URL
+    @fetch_details = fetch_details
+    @schedule = {
+      'day1' => { date: 'Apr 16', events: [] },
+      'day2' => { date: 'Apr 17', events: [] },
+      'day3' => { date: 'Apr 18', events: [] }
+    }
+    
     begin
       puts "ウェブサイトからスケジュール情報を取得しています..."
       @doc = Nokogiri::HTML(URI.open(@url))
@@ -22,12 +33,6 @@ class RubyKaigiScheduleParser
       puts e.message
       exit 1
     end
-    
-    @schedule = {
-      'day1' => { date: 'Apr 16', events: [] },
-      'day2' => { date: 'Apr 17', events: [] },
-      'day3' => { date: 'Apr 18', events: [] }
-    }
   end
 
   def parse
@@ -44,6 +49,11 @@ class RubyKaigiScheduleParser
       next unless day_pane
       
       parse_day(day_id, day_pane)
+    end
+    
+    # 詳細情報を取得するかどうか
+    if @fetch_details
+      fetch_session_details
     end
 
     @schedule
@@ -105,9 +115,10 @@ class RubyKaigiScheduleParser
             meta << meta_span.text.strip
           end
           
-          # リンク情報を取得
-          link = schedule_item.parent['href'] if schedule_item.parent.name == 'a'
-
+          # リンク情報を取得（スケジュールページから）
+          link_element = schedule_item.at_css('a')
+          link = link_element ? link_element['href'] : nil
+          
           # 会場情報
           venue = index < venues.length ? venues[index][:name] : 'Unknown Venue'
 
@@ -123,6 +134,75 @@ class RubyKaigiScheduleParser
         end
       end
     end
+  end
+  
+  def fetch_session_details
+    puts "各セッションの詳細情報を取得しています..."
+    total_sessions = 0
+    processed = 0
+    
+    @schedule.each do |day_id, day_data|
+      day_data[:events].each do |event|
+        next unless event[:type] == 'session' && event[:link]
+        total_sessions += 1
+      end
+    end
+    
+    @schedule.each do |day_id, day_data|
+      day_data[:events].each do |event|
+        next unless event[:type] == 'session' && event[:link]
+        
+        processed += 1
+        puts "セッション詳細を取得中 (#{processed}/#{total_sessions}): #{event[:title]}"
+        
+        begin
+          # 詳細ページのURLを作成
+          # URLのパターンは: https://rubykaigi.org/2025/presentations/[speaker_id].html#[day_id]
+          if event[:speakers].empty?
+            puts "  警告: #{event[:title]} にはスピーカー情報がありません。詳細情報をスキップします。"
+            next
+          end
+          
+          speaker_id = event[:speakers].first[:id]&.delete('@')
+          detail_url = "#{BASE_URL}/2025/presentations/#{speaker_id}.html##{day_id}"
+          puts "  アクセスするURL: #{detail_url}"
+          
+          detail_doc = Nokogiri::HTML(URI.open(detail_url))
+          
+          # 概要を取得
+          description = detail_doc.css('.m-presentation-content__description .e-long-text').text.strip
+          event[:description] = description if description && !description.empty?
+          
+          # スピーカーの詳細情報を取得
+          detail_doc.css('.m-member.is-speaker').each_with_index do |speaker_elem, idx|
+            next if idx >= event[:speakers].length
+            
+            # スピーカーのプロフィール情報
+            bio = speaker_elem.css('.m-member__description').text.strip
+            event[:speakers][idx][:bio] = bio if bio && !bio.empty?
+            
+            # SNSリンクを取得
+            sns_links = {}
+            speaker_elem.css('.m-member__sns-item.is-icon a').each do |link|
+              if link['class'].include?('is-github')
+                sns_links[:github] = link['href']
+              elsif link['class'].include?('is-twitter')
+                sns_links[:twitter] = link['href']
+              end
+            end
+            
+            event[:speakers][idx][:sns] = sns_links unless sns_links.empty?
+          end
+          
+          # スリープを入れて過剰なリクエストを防止
+          sleep(1)
+        rescue => e
+          puts "  警告: #{event[:title]} の詳細情報取得に失敗: #{e.message}"
+        end
+      end
+    end
+    
+    puts "セッション詳細の取得が完了しました。"
   end
 
   def print_summary
@@ -158,6 +238,11 @@ class RubyKaigiScheduleParser
           speaker_names = event[:speakers].map { |s| s[:name] }.join(', ')
           meta_info = event[:meta].any? ? " (#{event[:meta].join(', ')})" : ""
           puts "#{time_display} | #{event[:title]}#{meta_info} - #{speaker_names}"
+          
+          # 概要があれば出力
+          if event[:description]
+            puts "#{' ' * 11} | 概要: #{event[:description].gsub(/\s+/, ' ').strip}"
+          end
         end
       end
 
@@ -173,6 +258,11 @@ class RubyKaigiScheduleParser
           speaker_names = event[:speakers].map { |s| s[:name] }.join(', ')
           meta_info = event[:meta].any? ? " (#{event[:meta].join(', ')})" : ""
           puts "#{time_display} | #{event[:title]}#{meta_info} - #{speaker_names}"
+          
+          # 概要があれば出力
+          if event[:description]
+            puts "#{' ' * 11} | 概要: #{event[:description].gsub(/\s+/, ' ').strip}"
+          end
         end
       end
     end
@@ -189,6 +279,9 @@ class RubyKaigiScheduleParser
         keynotes.each do |keynote|
           speaker_names = keynote[:speakers].map { |s| s[:name] }.join(', ')
           puts "- #{keynote[:time_slot]}: #{keynote[:title]} - #{speaker_names}"
+          if keynote[:description]
+            puts "  概要: #{keynote[:description].gsub(/\s+/, ' ').strip}"
+          end
         end
       end
     end
@@ -222,7 +315,37 @@ class RubyKaigiScheduleParser
           speaker_names = event[:speakers].map { |s| s[:name] }.join(', ')
           meta_info = event[:meta].any? ? " (#{event[:meta].join(', ')})" : ""
           venue_info = event[:venue] ? " at #{event[:venue]}" : ""
-          markdown += "- **#{event[:time_slot]}** #{event[:title]}#{meta_info} - #{speaker_names}#{venue_info}\n"
+          
+          if event[:link]
+            markdown += "- **#{event[:time_slot]}** [#{event[:title]}](#{event[:link]})#{meta_info} - #{speaker_names}#{venue_info}\n"
+          else
+            markdown += "- **#{event[:time_slot]}** #{event[:title]}#{meta_info} - #{speaker_names}#{venue_info}\n"
+          end
+          
+          # 概要があれば出力
+          if event[:description]
+            markdown += "  - 概要: #{event[:description].gsub(/\s+/, ' ').strip}\n"
+          end
+          
+          # スピーカー情報
+          event[:speakers].each do |speaker|
+            if speaker[:bio] || (speaker[:sns] && speaker[:sns].any?)
+              markdown += "  - **#{speaker[:name]}** (#{speaker[:id]})"
+              
+              if speaker[:sns]
+                sns_links = []
+                sns_links << "[GitHub](#{speaker[:sns][:github]})" if speaker[:sns][:github]
+                sns_links << "[Twitter](#{speaker[:sns][:twitter]})" if speaker[:sns][:twitter]
+                markdown += " - #{sns_links.join(', ')}" if sns_links.any?
+              end
+              
+              markdown += "\n"
+              
+              if speaker[:bio]
+                markdown += "    - #{speaker[:bio].gsub(/\s+/, ' ').strip}\n"
+              end
+            end
+          end
         end
       end
 
@@ -234,7 +357,37 @@ class RubyKaigiScheduleParser
           speaker_names = event[:speakers].map { |s| s[:name] }.join(', ')
           meta_info = event[:meta].any? ? " (#{event[:meta].join(', ')})" : ""
           venue_info = event[:venue] ? " at #{event[:venue]}" : ""
-          markdown += "- **#{event[:time_slot]}** #{event[:title]}#{meta_info} - #{speaker_names}#{venue_info}\n"
+          
+          if event[:link]
+            markdown += "- **#{event[:time_slot]}** [#{event[:title]}](#{event[:link]})#{meta_info} - #{speaker_names}#{venue_info}\n"
+          else
+            markdown += "- **#{event[:time_slot]}** #{event[:title]}#{meta_info} - #{speaker_names}#{venue_info}\n"
+          end
+          
+          # 概要があれば出力
+          if event[:description]
+            markdown += "  - 概要: #{event[:description].gsub(/\s+/, ' ').strip}\n"
+          end
+          
+          # スピーカー情報
+          event[:speakers].each do |speaker|
+            if speaker[:bio] || (speaker[:sns] && speaker[:sns].any?)
+              markdown += "  - **#{speaker[:name]}** (#{speaker[:id]})"
+              
+              if speaker[:sns]
+                sns_links = []
+                sns_links << "[GitHub](#{speaker[:sns][:github]})" if speaker[:sns][:github]
+                sns_links << "[Twitter](#{speaker[:sns][:twitter]})" if speaker[:sns][:twitter]
+                markdown += " - #{sns_links.join(', ')}" if sns_links.any?
+              end
+              
+              markdown += "\n"
+              
+              if speaker[:bio]
+                markdown += "    - #{speaker[:bio].gsub(/\s+/, ' ').strip}\n"
+              end
+            end
+          end
         end
       end
 
@@ -252,8 +405,34 @@ class RubyKaigiScheduleParser
         markdown += "### #{day_id.upcase} キーノート\n"
         keynotes.each do |keynote|
           speaker_names = keynote[:speakers].map { |s| s[:name] }.join(', ')
-          venue_info = keynote[:venue] ? " at #{keynote[:venue]}" : ""
-          markdown += "- **#{keynote[:time_slot]}** #{keynote[:title]} - #{speaker_names}#{venue_info}\n"
+          
+          if keynote[:link]
+            markdown += "- **#{keynote[:time_slot]}** [#{keynote[:title]}](#{keynote[:link]}) - #{speaker_names}\n"
+          else
+            markdown += "- **#{keynote[:time_slot]}** #{keynote[:title]} - #{speaker_names}\n"
+          end
+          
+          if keynote[:description]
+            markdown += "  - 概要: #{keynote[:description].gsub(/\s+/, ' ').strip}\n"
+          end
+          
+          # スピーカー情報
+          keynote[:speakers].each do |speaker|
+            markdown += "  - **#{speaker[:name]}** (#{speaker[:id]})"
+            
+            if speaker[:sns]
+              sns_links = []
+              sns_links << "[GitHub](#{speaker[:sns][:github]})" if speaker[:sns][:github]
+              sns_links << "[Twitter](#{speaker[:sns][:twitter]})" if speaker[:sns][:twitter]
+              markdown += " - #{sns_links.join(', ')}" if sns_links.any?
+            end
+            
+            markdown += "\n"
+            
+            if speaker[:bio]
+              markdown += "    - #{speaker[:bio].gsub(/\s+/, ' ').strip}\n"
+            end
+          end
         end
         markdown += "\n"
       end
@@ -289,6 +468,10 @@ option_parser = OptionParser.new do |opts|
   opts.on("--url URL", "スケジュールページのURLを指定 (デフォルト: #{RubyKaigiScheduleParser::SCHEDULE_URL})") do |url|
     options[:url] = url
   end
+  
+  opts.on("--fetch-details", "各セッションの詳細ページから追加情報を取得する") do
+    options[:fetch_details] = true
+  end
 
   opts.on("-h", "--help", "ヘルプを表示") do
     puts opts
@@ -299,7 +482,7 @@ end
 option_parser.parse!
 
 # メイン処理
-parser = RubyKaigiScheduleParser.new(options[:url])
+parser = RubyKaigiScheduleParser.new(options[:url], options[:fetch_details])
 parser.parse
 
 # デフォルトではサマリーを表示
